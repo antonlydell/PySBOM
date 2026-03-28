@@ -381,12 +381,12 @@ CREATE TABLE IF NOT EXISTS artifact_status (
 CREATE SEQUENCE IF NOT EXISTS session_artifact_pk_sequence;
 
 CREATE TABLE IF NOT EXISTS session_artifact (
-    session_artifact_id  UBIGINT  NOT NULL DEFAULT nextval('session_artifact_pk_sequence')
-    , session_id         UUID     NOT NULL
+    session_artifact_id  UBIGINT     NOT NULL DEFAULT nextval('session_artifact_pk_sequence')
+    , session_id         UUID        NOT NULL
 
-    , artifact_type_id   UTINYINT NOT NULL
-    , artifact_action_id UTINYINT NOT NULL
-    , artifact_status_id UTINYINT NOT NULL
+    , artifact_type_id   UTINYINT    NOT NULL
+    , artifact_action_id UTINYINT    NOT NULL
+    , artifact_status_id UTINYINT    NOT NULL
 
     -- Artifact references (exactly one must be set)
     , env_id             UINTEGER
@@ -420,16 +420,30 @@ CREATE TABLE IF NOT EXISTS session_artifact (
     , CONSTRAINT session_artifact_fk7 FOREIGN KEY(sbom_document_id)
         REFERENCES sbom_document(sbom_document_id)
 
-    -- exactly one type of artifact can be produced in a session
+    -- exactly one referenced object
     , CONSTRAINT session_artifact_ck1 CHECK (
         (CASE WHEN env_id IS NULL THEN 0 ELSE 1 END) +
         (CASE WHEN sbom_file_id IS NULL THEN 0 ELSE 1 END) +
         (CASE WHEN sbom_document_id IS NULL THEN 0 ELSE 1 END)
         = 1
     )
+
+    -- artifact_type_id must match the populated FK
+    , CONSTRAINT session_artifact_ck2 CHECK (
+        (artifact_type_id = 1 AND env_id IS NOT NULL AND sbom_file_id IS NULL AND sbom_document_id IS NULL)
+        OR
+        (artifact_type_id = 2 AND env_id IS NULL AND sbom_file_id IS NOT NULL AND sbom_document_id IS NULL)
+        OR
+        (artifact_type_id = 3 AND env_id IS NULL AND sbom_file_id IS NULL AND sbom_document_id IS NOT NULL)
+    )
 );
 
-COMMENT ON TABLE session_artifact IS 'Audit/event log of what has been produced during a session.';
+CREATE INDEX IF NOT EXISTS session_artifact_i1
+    ON session_artifact(session_id);
+
+CREATE INDEX IF NOT EXISTS session_artifact_i2
+    ON session_artifact(session_id, created_at);
+
 
 
 -- ================================================================================================
@@ -450,14 +464,29 @@ CREATE TABLE IF NOT EXISTS package_type (
     , CONSTRAINT package_type_u1 UNIQUE(code)
 );
 
+CREATE TABLE IF NOT EXISTS package_source (
+    package_source_id UTINYINT    NOT NULL
+    , code            VARCHAR     NOT NULL
+    , name            VARCHAR     NOT NULL
+    , description     VARCHAR
+    , is_deprecated   BOOLEAN     DEFAULT false
+    , created_at      TIMESTAMPTZ DEFAULT current_timestamp
+
+    , CONSTRAINT package_source_pk PRIMARY KEY(package_source_id)
+    , CONSTRAINT package_source_u1 UNIQUE(code)
+);
+
+COMMENT ON TABLE package_source IS 'Where a package-like object was found within the SBOM.';
+COMMENT ON COLUMN package_source.code IS 'Examples: components, metadata_tools';
+
 
 CREATE TABLE IF NOT EXISTS package (
     package_id            UUID        NOT NULL DEFAULT uuidv7()
     , sbom_document_id    UUID        NOT NULL
-    , is_tool             BOOLEAN              DEFAULT false
+    , package_source_id   UTINYINT    NOT NULL
     , package_type_id     UINTEGER
 
-    , bom_ref             VARCHAR     NOT NULL
+    , bom_ref             VARCHAR
     , name                VARCHAR     NOT NULL
     , version             VARCHAR
     , purl                VARCHAR
@@ -480,17 +509,27 @@ CREATE TABLE IF NOT EXISTS package (
     , created_at          TIMESTAMPTZ DEFAULT current_timestamp
 
     , CONSTRAINT package_pk PRIMARY KEY(package_id)
-    , CONSTRAINT package_u1 UNIQUE(sbom_document_id, bom_ref)
+
+    -- Needed later for composite FK protection in package_dependency
+    , CONSTRAINT package_u1 UNIQUE(package_id)
+    , CONSTRAINT package_u2 UNIQUE(sbom_document_id, package_id)
+
+    -- bom_ref is source-faithful and nullable
+    , CONSTRAINT package_u3 UNIQUE(sbom_document_id, bom_ref)
 
     , CONSTRAINT package_fk1 FOREIGN KEY(sbom_document_id)
         REFERENCES sbom_document(sbom_document_id)
 
     , CONSTRAINT package_fk2 FOREIGN KEY(package_type_id)
         REFERENCES package_type(package_type_id)
+
+    , CONSTRAINT package_fk3 FOREIGN KEY(package_source_id)
+        REFERENCES package_source(package_source_id)
 );
 
-COMMENT ON TABLE package IS 'A package found in an SBOM document.';
-COMMENT ON COLUMN package.is_tool IS 'True if the package is a tool used to produce an SBOM document and False for a regular package.';
+COMMENT ON TABLE package IS 'A package-like object found in an SBOM document, including regular components and metadata tools.';
+COMMENT ON COLUMN package.bom_ref IS 'Nullable because metadata.tools.components may not provide bom-ref.';
+COMMENT ON COLUMN package.package_source_id IS 'Distinguishes regular components from metadata tools without requiring separate tables.';
 
 
 CREATE SEQUENCE IF NOT EXISTS license_pk_sequence;
@@ -526,6 +565,7 @@ CREATE TABLE IF NOT EXISTS package_license_link (
 COMMENT ON TABLE package_license_link IS 'The link between a package and its licenses.';
 
 
+
 CREATE TABLE IF NOT EXISTS package_dependency (
     sbom_document_id  UUID        NOT NULL
     , from_package_id UUID        NOT NULL
@@ -537,13 +577,15 @@ CREATE TABLE IF NOT EXISTS package_dependency (
     , CONSTRAINT package_dependency_fk1 FOREIGN KEY(sbom_document_id)
         REFERENCES sbom_document(sbom_document_id)
 
-    , CONSTRAINT package_dependency_fk2 FOREIGN KEY(from_package_id)
-        REFERENCES package(package_id)
+    , CONSTRAINT package_dependency_fk2 FOREIGN KEY(sbom_document_id, from_package_id)
+        REFERENCES package(sbom_document_id, package_id)
 
-    , CONSTRAINT package_dependency_fk3 FOREIGN KEY(to_package_id)
-        REFERENCES package(package_id)
+    , CONSTRAINT package_dependency_fk3 FOREIGN KEY(sbom_document_id, to_package_id)
+        REFERENCES package(sbom_document_id, package_id)
+
+    , CONSTRAINT package_dependency_ck1 CHECK (from_package_id <> to_package_id)
 );
 
-COMMENT ON TABLE package_dependency IS 'The dependencies of a package.';
-COMMENT ON COLUMN package_dependency.from_package_id IS 'The package that has a dependency to another package listed in `to_package_id`.';
-COMMENT ON COLUMN package_dependency.to_package_id IS 'The package that is a dependency of the package listed in `from_package_id`.';
+COMMENT ON TABLE package_dependency IS 'Dependencies between packages within a single SBOM document.';
+COMMENT ON COLUMN package_dependency.from_package_id IS 'The dependent package.';
+COMMENT ON COLUMN package_dependency.to_package_id IS 'The package being depended upon.';
